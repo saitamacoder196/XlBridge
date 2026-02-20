@@ -1,0 +1,13 @@
+# XlBridge Export
+# Source: sample.xlsx
+# Date: 2026-02-20
+# Encoding: UTF-8
+
+[Sheet1]!A1|プロジェクト名
+[Sheet1]!B1|概要
+[Sheet1]!A2|システム設計書
+[Sheet1]!B2|本ドキュメントはシステム設計の概要を記載する
+[Sheet2]!A1|機能要件
+[Sheet2]!B1|説明
+[Sheet2]!A2|ログイン機能
+[Sheet2]!B2|ユーザー認証を行う

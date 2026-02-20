@@ -1,0 +1,13 @@
+# XlBridge Export
+# Source: sample.xlsx
+# Date: 2026-02-20
+# Encoding: UTF-8
+
+[Sheet1]!A1|Tên dự án
+[Sheet1]!B1|Tổng quan
+[Sheet1]!A2|Tài liệu thiết kế hệ thống
+[Sheet1]!B2|Tài liệu này mô tả tổng quan về thiết kế hệ thống
+[Sheet2]!A1|Yêu cầu chức năng
+[Sheet2]!B1|Mô tả
+[Sheet2]!A2|Chức năng đăng nhập
+[Sheet2]!B2|Thực hiện xác thực người dùng
