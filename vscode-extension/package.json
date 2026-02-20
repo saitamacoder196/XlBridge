@@ -1,0 +1,76 @@
+{
+  "name": "copatis-vscode",
+  "displayName": "Copatis",
+  "description": "Excel translation bridge — extract, translate and inject with Copilot Chat",
+  "version": "0.1.0",
+  "publisher": "copatis",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "excel",
+    "translation",
+    "xlsx",
+    "copilot",
+    "chat",
+    "japanese"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "copatis.assistant",
+        "fullName": "Copatis Assistant",
+        "name": "copatis",
+        "description": "Extract, translate và inject nội dung Excel cho quy trình dịch thuật",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "extract",
+            "description": "Extract nội dung file .xlsx ra file .txt để dịch"
+          },
+          {
+            "name": "inject",
+            "description": "Inject bản dịch từ .txt trở lại vào file .xlsx"
+          },
+          {
+            "name": "translate",
+            "description": "Dịch nội dung file TXT sang tiếng Anh và tiếng Việt bằng LLM"
+          },
+          {
+            "name": "help",
+            "description": "Hiển thị hướng dẫn sử dụng Copatis"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "copatis.extract",
+        "title": "Copatis: Extract Excel Content",
+        "category": "Copatis"
+      },
+      {
+        "command": "copatis.inject",
+        "title": "Copatis: Inject Translations",
+        "category": "Copatis"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc --watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.7.1",
+    "typescript": "^5.3.0"
+  }
+}

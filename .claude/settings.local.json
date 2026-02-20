@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx vsce:*)",
+      "Bash(npm run compile:*)"
+    ]
+  }
+}

@@ -4,3 +4,26 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+
+# Logs
+*.log
+
+# Node.js / VS Code Extension
+node_modules/
+out/
+*.vsix
+.vscode-test/
+vscode-extension/test_data/
+
+# Project Specific Output and Data
+split_output/
+translation_runs/
+
+# OS specific
+.DS_Store
+Thumbs.db

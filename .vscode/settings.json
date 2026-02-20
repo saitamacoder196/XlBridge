@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python translate_batch_0011_0020\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
