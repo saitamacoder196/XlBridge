@@ -3,6 +3,7 @@ import * as cp from 'child_process';
 import * as util from 'util';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 
 const exec = util.promisify(cp.exec);
 
@@ -107,6 +108,126 @@ function parseFilenameArg(prompt: string, ext: string): string | undefined {
 
 function elapsed(startMs: number): string {
     return `${Date.now() - startMs}ms`;
+}
+
+// ─── Language helpers ─────────────────────────────────────────────────────────
+
+type TargetLang = 'en' | 'vi';
+
+/**
+ * Translated line format  : [Sheet]!Cell|Original|EN|VI
+ * Original (no-translate) : [Sheet]!Cell|Original
+ *
+ * Returns { lang, usedFallback } where usedFallback=true means
+ * the target-language column was missing → fell back to original.
+ */
+interface SelectResult {
+    value: string;
+    usedFallback: boolean;
+}
+
+function selectValue(rawAfterCell: string, lang: TargetLang): SelectResult {
+    const parts = rawAfterCell.split('|');
+    // parts[0]=Original, parts[1]=EN, parts[2]=VI
+    if (lang === 'en') {
+        const en = parts[1]?.trim();
+        return en
+            ? { value: en, usedFallback: false }
+            : { value: parts[0], usedFallback: true };
+    } else {
+        const vi = parts[2]?.trim();
+        return vi
+            ? { value: vi, usedFallback: false }
+            : { value: parts[0], usedFallback: true };
+    }
+}
+
+/** Detect EN / VI from the user prompt. Returns undefined if not found. */
+function detectLangFromPrompt(prompt: string): TargetLang | undefined {
+    const p = prompt.toLowerCase();
+    if (/\ben\b|english|tiếng[\s-]?anh/.test(p)) return 'en';
+    if (/\bvi\b|vietnamese|tiếng[\s-]?việt/.test(p)) return 'vi';
+    return undefined;
+}
+
+/** Detect whether the user is asking for an unsupported language. */
+function detectOtherLang(prompt: string): string | undefined {
+    const p = prompt.toLowerCase();
+    const mapping: [RegExp, string][] = [
+        [/\bjapanese\b|日本語|\bja\b|\bjp\b/, 'Tiếng Nhật'],
+        [/\bchinese\b|中文|\bzh\b/, 'Tiếng Trung'],
+        [/\bkorean\b|한국어|\bko\b/, 'Tiếng Hàn'],
+        [/\bfrench\b|français|\bfr\b/, 'Tiếng Pháp'],
+        [/\bgerman\b|deutsch|\bde\b/, 'Tiếng Đức'],
+        [/\bspanish\b|español|\bes\b/, 'Tiếng Tây Ban Nha'],
+        [/\bjapan\b/, 'Tiếng Nhật'],
+    ];
+    for (const [re, name] of mapping) {
+        if (re.test(p)) return name;
+    }
+    return undefined;
+}
+
+/** Show a QuickPick and let user choose the target language. */
+async function pickTargetLang(): Promise<TargetLang | undefined> {
+    type Item = vscode.QuickPickItem & { lang: TargetLang };
+    const items: Item[] = [
+        { label: '$(globe) Tiếng Anh (EN)', description: 'Inject cột bản dịch Tiếng Anh', lang: 'en' },
+        { label: '$(globe) Tiếng Việt (VI)', description: 'Inject cột bản dịch Tiếng Việt', lang: 'vi' },
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Chọn ngôn ngữ đích để inject vào Excel (chỉ hỗ trợ EN và VI)',
+        title: 'Copatis — Ngôn ngữ đích',
+    });
+    return picked?.lang;
+}
+
+/**
+ * Transform a TXT file (original or translated) into a minimal
+ * [Sheet]!Cell|Value file ready for `xlbridge inject`.
+ *
+ * Returns { content, stats }.
+ */
+interface TransformStats {
+    total: number;
+    translated: number;
+    fallback: number;       // had no target-lang column → used original
+    commentOrBlank: number;
+}
+
+function buildInjectContent(
+    lines: string[],
+    lang: TargetLang,
+): { content: string; stats: TransformStats } {
+    const stats: TransformStats = { total: 0, translated: 0, fallback: 0, commentOrBlank: 0 };
+    const out: string[] = [];
+
+    for (const raw of lines) {
+        const line = raw.trimEnd();
+
+        if (line.startsWith('#') || line === '') {
+            stats.commentOrBlank++;
+            out.push(line);
+            continue;
+        }
+
+        const pipeIdx = line.indexOf('|');
+        if (pipeIdx === -1) {
+            out.push(line);     // malformed — pass through
+            continue;
+        }
+
+        const cellRef      = line.slice(0, pipeIdx);
+        const afterCell    = line.slice(pipeIdx + 1);
+        const { value, usedFallback } = selectValue(afterCell, lang);
+
+        stats.total++;
+        if (usedFallback) { stats.fallback++; } else { stats.translated++; }
+
+        out.push(`${cellRef}|${value}`);
+    }
+
+    return { content: out.join('\n'), stats };
 }
 
 // ─── /extract ─────────────────────────────────────────────────────────────────
@@ -236,6 +357,38 @@ async function handleInject(
 
     stream.markdown('### Copatis — Inject\n\n');
 
+    // ── 1. Resolve target language ──
+
+    // Check for unsupported language first
+    const otherLang = detectOtherLang(request.prompt);
+    if (otherLang) {
+        log.warn('Inject', 'Unsupported language requested', { lang: otherLang });
+        stream.markdown(
+            `❌ **Ngôn ngữ chưa được hỗ trợ: ${otherLang}**\n\n`
+            + 'Copatis hiện chỉ hỗ trợ inject cho:\n'
+            + '- **Tiếng Anh (EN)**: `@copatis /inject en`\n'
+            + '- **Tiếng Việt (VI)**: `@copatis /inject vi`\n',
+        );
+        return;
+    }
+
+    let lang = detectLangFromPrompt(request.prompt);
+    if (!lang) {
+        log.info('Inject', 'Language not in prompt — showing QuickPick');
+        lang = await pickTargetLang();
+    }
+    if (!lang) {
+        log.warn('Inject', 'User cancelled language selection');
+        stream.markdown('❌ Chưa chọn ngôn ngữ đích. Hãy thử:\n```\n@copatis /inject en\n@copatis /inject vi\n```');
+        return;
+    }
+
+    const langLabel = lang === 'en' ? 'Tiếng Anh (EN)' : 'Tiếng Việt (VI)';
+    log.info('Inject', 'Language selected', { lang, label: langLabel });
+    stream.markdown(`🌐 Ngôn ngữ đích: **${langLabel}**\n\n`);
+
+    // ── 2. Resolve files ──
+
     const specifiedXlsx = parseFilenameArg(request.prompt, 'xlsx');
     const specifiedTxt  = parseFilenameArg(request.prompt, 'txt');
     const ws = workspacePath() || '';
@@ -273,34 +426,95 @@ async function handleInject(
         xlsxFiles.forEach(f => stream.markdown(`- \`${vscode.workspace.asRelativePath(f)}\`\n`));
         stream.markdown('\n📝 **File translation tìm thấy:**\n');
         txtFiles.slice(0, 8).forEach(f => stream.markdown(`- \`${vscode.workspace.asRelativePath(f)}\`\n`));
-        stream.markdown('\n> ```\n> @copatis /inject file.xlsx translated.txt\n> ```');
+        stream.markdown('\n> ```\n> @copatis /inject en file.xlsx translated.txt\n> ```');
         return;
     }
 
-    const outputPath = xlsxPath.replace(/\.xlsx?$/i, '_translated.xlsx');
-    log.info('Inject', 'Plan', {
-        xlsx:   vscode.workspace.asRelativePath(xlsxPath),
-        txt:    vscode.workspace.asRelativePath(txtPath),
-        output: vscode.workspace.asRelativePath(outputPath),
+    // ── 3. Transform TXT → target language ──
+
+    log.info('Inject', 'Reading translation file', { path: vscode.workspace.asRelativePath(txtPath) });
+    let rawContent: string;
+    try {
+        rawContent = fs.readFileSync(txtPath, 'utf-8');
+    } catch (err) {
+        log.error('Inject', 'Cannot read TXT file', { error: String(err) });
+        stream.markdown(`❌ Không đọc được file TXT: ${err}`);
+        return;
+    }
+
+    const lines = rawContent.replace(/\r\n/g, '\n').split('\n');
+    const { content: injectContent, stats } = buildInjectContent(lines, lang);
+
+    log.info('Inject', 'Transform done', {
+        lang,
+        total:      stats.total,
+        translated: stats.translated,
+        fallback:   stats.fallback,
     });
 
-    stream.markdown(`📊 Excel : \`${vscode.workspace.asRelativePath(xlsxPath)}\`\n`);
-    stream.markdown(`📝 TXT   : \`${vscode.workspace.asRelativePath(txtPath)}\`\n`);
-    stream.markdown(`📤 Output: \`${vscode.workspace.asRelativePath(outputPath)}\`\n\n`);
-    stream.progress('Đang chạy xlbridge inject...');
+    if (stats.fallback > 0) {
+        log.warn('Inject', 'Some cells missing target-lang column — used original', {
+            fallback: stats.fallback,
+            hint: 'Run @copatis /translate first to generate EN/VI columns',
+        });
+    }
+
+    // ── 4. Write temp file ──
+
+    const tmpFile = path.join(os.tmpdir(), `copatis_inject_${lang}_${Date.now()}.txt`);
+    try {
+        fs.writeFileSync(tmpFile, injectContent, 'utf-8');
+        log.info('Inject', 'Temp file written', { path: tmpFile });
+    } catch (err) {
+        log.error('Inject', 'Cannot write temp file', { path: tmpFile, error: String(err) });
+        stream.markdown(`❌ Không tạo được file tạm: ${err}`);
+        return;
+    }
+
+    // ── 5. Build output path & log plan ──
+
+    const langSuffix  = lang === 'en' ? '_en' : '_vi';
+    const outputPath  = xlsxPath.replace(/\.xlsx?$/i, `${langSuffix}.xlsx`);
+
+    log.info('Inject', 'Plan', {
+        xlsx:       vscode.workspace.asRelativePath(xlsxPath),
+        txt:        vscode.workspace.asRelativePath(txtPath),
+        tmpFile:    path.basename(tmpFile),
+        output:     vscode.workspace.asRelativePath(outputPath),
+        translated: stats.translated,
+        fallback:   stats.fallback,
+    });
+
+    stream.markdown(`📊 Excel  : \`${vscode.workspace.asRelativePath(xlsxPath)}\`\n`);
+    stream.markdown(`📝 TXT    : \`${vscode.workspace.asRelativePath(txtPath)}\`\n`);
+    stream.markdown(`📤 Output : \`${vscode.workspace.asRelativePath(outputPath)}\`\n`);
+    stream.markdown(`📋 Cells  : ${stats.translated} đã dịch`
+        + (stats.fallback > 0 ? `, ${stats.fallback} dùng bản gốc (chưa có ${langLabel})` : '')
+        + '\n\n');
+
+    if (stats.fallback > 0) {
+        stream.markdown(
+            `> ⚠️ **${stats.fallback} ô** chưa có bản dịch ${langLabel} → dùng văn bản gốc.\n`
+            + '> Chạy `@copatis /translate` trước để tạo đủ bản dịch.\n\n',
+        );
+    }
+
+    stream.progress(`Đang inject ${langLabel} vào Excel...`);
+
+    // ── 6. Run xlbridge inject ──
 
     try {
         const { stdout, stderr } = await runXlbridge([
             'inject',
             '--input',       `"${xlsxPath}"`,
-            '--translation', `"${txtPath}"`,
+            '--translation', `"${tmpFile}"`,
             '--output',      `"${outputPath}"`,
         ]);
 
         const cellMatch = (stdout + stderr).match(/Injected (\d+)\/(\d+)/);
-        const injected = cellMatch ? `${cellMatch[1]}/${cellMatch[2]}` : '?';
+        const injected  = cellMatch ? `${cellMatch[1]}/${cellMatch[2]}` : `${stats.translated}/?`;
 
-        log.info('Inject', 'Done', { cells: injected, elapsed: elapsed(t0) });
+        log.info('Inject', 'Done', { lang, cells: injected, elapsed: elapsed(t0) });
         if (stderr.trim()) log.info('Inject', 'Stderr', { msg: stderr.trim() });
 
         stream.markdown('✅ **Inject thành công!**\n\n');
@@ -318,6 +532,10 @@ async function handleInject(
         const msg = err instanceof Error ? err.message : String(err);
         log.error('Inject', 'Failed', { elapsed: elapsed(t0), error: msg.split('\n')[0] });
         stream.markdown(`❌ **Lỗi:** \`\`\`\n${msg}\n\`\`\``);
+    } finally {
+        // Clean up temp file
+        try { fs.unlinkSync(tmpFile); log.info('Inject', 'Temp file removed'); }
+        catch { /* non-critical */ }
     }
 }
 
@@ -565,8 +783,10 @@ async function handleHelp(stream: vscode.ChatResponseStream): Promise<void> {
 | \`@copatis /extract\` | Extract tất cả sheet từ file .xlsx |
 | \`@copatis /extract file.xlsx\` | Extract file cụ thể |
 | \`@copatis /extract file.xlsx --sheet Sheet1\` | Chỉ extract sheet chỉ định |
-| \`@copatis /inject\` | Inject bản dịch (tự tìm file) |
-| \`@copatis /inject file.xlsx translated.txt\` | Inject với file chỉ định |
+| \`@copatis /inject en\` | Inject bản dịch Tiếng Anh (tự tìm file) |
+| \`@copatis /inject vi\` | Inject bản dịch Tiếng Việt (tự tìm file) |
+| \`@copatis /inject en file.xlsx translated.txt\` | Inject Tiếng Anh với file chỉ định |
+| \`@copatis /inject vi file.xlsx translated.txt\` | Inject Tiếng Việt với file chỉ định |
 | \`@copatis /translate\` | Dịch file TXT sang EN + VI (mở file picker) |
 | \`@copatis /translate file.txt\` | Dịch file TXT chỉ định |
 | \`@copatis /help\` | Hiển thị trợ giúp này |

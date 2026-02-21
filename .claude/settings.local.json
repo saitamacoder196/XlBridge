@@ -3,7 +3,12 @@
     "allow": [
       "Bash(npm install:*)",
       "Bash(npx vsce:*)",
-      "Bash(npm run compile:*)"
+      "Bash(npm run compile:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(py -m pytest tests/test_parser.py tests/test_injector.py -v)",
+      "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -m pytest tests/test_parser.py tests/test_injector.py -v)",
+      "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -m pip install pytest -q)"
     ]
   }
 }

@@ -25,8 +25,15 @@ def main(argv: list[str] | None = None) -> None:
     # inject
     p_inject = subparsers.add_parser("inject", help="Inject translated TXT back into Excel")
     p_inject.add_argument("--input", "-i", required=True, help="Original Excel file")
-    p_inject.add_argument("--translation", "-t", required=True, help="Translated TXT file")
-    p_inject.add_argument("--output", "-o", default=None, help="Output Excel file (default: *_translated.xlsx)")
+    p_inject.add_argument("--translation", "-t", required=True, help="Translated TXT file (2- or 4-column format)")
+    p_inject.add_argument("--output", "-o", default=None, help="Output Excel file (default: *_<lang>.xlsx or *_translated.xlsx)")
+    p_inject.add_argument(
+        "--lang", "-l",
+        choices=["en", "vi"],
+        default=None,
+        help="Target language column to inject: 'en' (English) or 'vi' (Vietnamese). "
+             "Omit to inject the original value (column 1).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -38,7 +45,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "extract":
         extract(args.input, args.output, sheet_names=args.sheet)
     elif args.command == "inject":
-        output = inject(args.input, args.translation, output_path=args.output)
+        output = inject(args.input, args.translation, output_path=args.output, lang=args.lang)
         print(f"Output written to: {output}")
 
 
