@@ -73,6 +73,117 @@ class Logger {
 // Module-level singleton — created once in activate()
 let log: Logger;
 
+// ─── Dictionary ───────────────────────────────────────────────────────────────
+// Persistent JSON map: Japanese source text → target language text.
+// File format: { "日本語": "translation", ... } sorted by key.
+
+class Dictionary {
+    private readonly data = new Map<string, string>();
+    private added = 0;   // entries added since construction
+
+    constructor(private readonly filePath: string) {
+        this.load();
+    }
+
+    lookup(key: string): string | undefined {
+        return this.data.get(key);
+    }
+
+    set(key: string, value: string): void {
+        if (!this.data.has(key)) this.added++;
+        this.data.set(key, value);
+    }
+
+    get size(): number  { return this.data.size; }
+    get newCount(): number { return this.added; }
+
+    /** Write to disk. Returns number of new entries added. Idempotent. */
+    save(): number {
+        try {
+            const obj: Record<string, string> = {};
+            for (const k of [...this.data.keys()].sort()) { obj[k] = this.data.get(k)!; }
+            fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+            fs.writeFileSync(this.filePath, JSON.stringify(obj, null, 2), 'utf-8');
+            log.info('Dict', 'Saved', { path: this.filePath, total: this.data.size, new: this.added });
+        } catch (err) {
+            log.error('Dict', 'Save failed', { path: this.filePath, error: String(err) });
+        }
+        return this.added;
+    }
+
+    private load(): void {
+        if (!fs.existsSync(this.filePath)) return;
+        try {
+            const obj = JSON.parse(fs.readFileSync(this.filePath, 'utf-8')) as Record<string, string>;
+            for (const [k, v] of Object.entries(obj)) { this.data.set(k, v); }
+        } catch (err) {
+            log.warn('Dict', 'Load failed — starting empty', { path: this.filePath, error: String(err) });
+        }
+    }
+}
+
+// ─── Pattern Library ──────────────────────────────────────────────────────────
+// Persistent JSON array of regex-based translation templates.
+// File format: [{ "regex": "...", "en_template": "...", "vi_template": "..." }, ...]
+// Capture groups in regex map to {0}, {1}, ... placeholders in templates.
+
+interface PatternEntry {
+    regex: string;        // ECMAScript regex with capture groups for variable parts
+    en_template: string;  // English template, e.g. "Order No.: {0}"
+    vi_template: string;  // Vietnamese template, e.g. "Số đơn hàng: {0}"
+}
+
+class PatternLibrary {
+    private entries: PatternEntry[] = [];
+    private added = 0;
+
+    constructor(private readonly filePath: string) {
+        this.load();
+    }
+
+    /** Try to match value against all patterns. Returns null if no match. */
+    match(value: string): { entry: PatternEntry; groups: string[] } | null {
+        for (const entry of this.entries) {
+            try {
+                const m = new RegExp(entry.regex).exec(value);
+                if (m) { return { entry, groups: m.slice(1) }; }
+            } catch { /* invalid regex — skip */ }
+        }
+        return null;
+    }
+
+    add(entry: PatternEntry): void {
+        if (!this.entries.some(e => e.regex === entry.regex)) {
+            this.entries.push(entry);
+            this.added++;
+        }
+    }
+
+    get size(): number  { return this.entries.length; }
+    get newCount(): number { return this.added; }
+
+    save(): number {
+        try {
+            fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+            fs.writeFileSync(this.filePath, JSON.stringify(this.entries, null, 2), 'utf-8');
+            log.info('Pattern', 'Saved', { path: this.filePath, total: this.entries.length, new: this.added });
+        } catch (err) {
+            log.error('Pattern', 'Save failed', { path: this.filePath, error: String(err) });
+        }
+        return this.added;
+    }
+
+    private load(): void {
+        if (!fs.existsSync(this.filePath)) return;
+        try {
+            const arr = JSON.parse(fs.readFileSync(this.filePath, 'utf-8')) as PatternEntry[];
+            if (Array.isArray(arr)) { this.entries = arr; }
+        } catch (err) {
+            log.warn('Pattern', 'Load failed — starting empty', { path: this.filePath, error: String(err) });
+        }
+    }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function workspacePath(): string | undefined {
@@ -108,6 +219,25 @@ function parseFilenameArg(prompt: string, ext: string): string | undefined {
 
 function elapsed(startMs: number): string {
     return `${Date.now() - startMs}ms`;
+}
+
+function getCfg<T>(key: string, fallback: T): T {
+    return vscode.workspace.getConfiguration('copatis').get<T>(key) ?? fallback;
+}
+
+function getBatchSize(): number {
+    return Math.max(1, Math.min(200, getCfg<number>('batchSize', 25)));
+}
+
+function getMaxRetries(): number {
+    return Math.max(1, Math.min(10, getCfg<number>('llmMaxRetries', 3)));
+}
+
+function getDictDir(): string {
+    const configured = getCfg<string>('dictDir', '').trim();
+    if (configured) return configured;
+    const ws = workspacePath();
+    return ws ? path.join(ws, 'copatis_dicts') : path.join(os.homedir(), 'copatis_dicts');
 }
 
 // ─── Language helpers ─────────────────────────────────────────────────────────
@@ -541,31 +671,139 @@ async function handleInject(
 
 // ─── /translate ───────────────────────────────────────────────────────────────
 
-const TRANSLATE_BATCH_SIZE = 25;
-
-interface TranslationPair { en: string; vi: string; }
+interface LLMTranslation { type: 'translation'; en: string; vi: string; }
+interface LLMPattern    { type: 'pattern'; regex: string; en_template: string; vi_template: string; en: string; vi: string; }
+type LLMResult = LLMTranslation | LLMPattern;
 
 function parseDataLine(line: string): { prefix: string; value: string } | undefined {
-    const match = line.match(/^(\[[^\]]+\]![A-Za-z]+\d+)\|(.+)$/);
+    // Matches cell (A1), shape (shape:Name), and note (note:A1) address types.
+    const match = line.match(/^(\[[^\]]+\]!(?:[A-Za-z]+\d+|shape:[^|]+|note:[A-Za-z]+\d+))\|(.+)$/);
     if (!match) return undefined;
     return { prefix: match[1], value: match[2] };
 }
 
-async function translateBatch(
+/** Escape literal newlines → \\n so each entry stays on a single line. */
+function escNl(s: string): string { return s.replace(/\r?\n/g, '\\n'); }
+
+/**
+ * Returns true only if the value contains Japanese/CJK characters that need
+ * translation. Values that are already English, numeric, date/time, symbolic,
+ * or a mix of ASCII + punctuation are passed through unchanged.
+ *
+ * Covered ranges:
+ *   U+3040–309F  Hiragana
+ *   U+30A0–30FF  Katakana (full-width)
+ *   U+31F0–31FF  Katakana Phonetic Extensions
+ *   U+FF65–FF9F  Halfwidth Katakana
+ *   U+4E00–9FFF  CJK Unified Ideographs (kanji)
+ *   U+3400–4DBF  CJK Extension A
+ *   U+F900–FAFF  CJK Compatibility Ideographs
+ */
+const JP_PATTERN = /[\u3040-\u309F\u30A0-\u30FF\u31F0-\u31FF\uFF65-\uFF9F\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/;
+
+/**
+ * Strings consisting ONLY of these characters pass through unchanged.
+ * These are common Japanese business/IPA document symbols that carry no
+ * translatable meaning — they are status marks, punctuation, or decorative marks.
+ *
+ *   〇○●◎◯  — circle marks (OK / applicable / excellent)
+ *   △▲▽▼    — triangle marks (partial / conditional)
+ *   □■◆◇    — square / diamond marks
+ *   ×✕✓✔   — cross / checkmark
+ *   ★☆       — star ratings
+ *   ー (U+30FC) — katakana long-vowel mark, used as a dash
+ *   ・ (U+30FB) — katakana middle dot, used as a bullet/separator
+ *   ゠ヽヾゝゞ — katakana/hiragana iteration marks
+ *   ━―─…    — dash / horizontal rule / ellipsis
+ */
+const SYMBOL_ONLY = /^[\s〇○●◎◯△▲▽▼□■◆◇×✕✓✔★☆\u30FB\u30FC\u30A0\u30FD\u30FE\u30FF\u309D\u309E━―─…]+$/;
+
+function needsTranslation(value: string): boolean {
+    if (!value.trim()) return false;            // blank / whitespace-only
+    if (SYMBOL_ONLY.test(value)) return false;  // document symbols — no translation needed
+    return JP_PATTERN.test(value);
+}
+
+// ── Low-level LLM call ────────────────────────────────────────────────────────
+
+function validateLLMResults(raw: unknown, expected: number): asserts raw is LLMResult[] {
+    if (!Array.isArray(raw)) {
+        throw new Error(`Response is not an array (got ${typeof raw})`);
+    }
+    if (raw.length !== expected) {
+        throw new Error(`Length mismatch: expected ${expected}, got ${raw.length}`);
+    }
+    for (let i = 0; i < raw.length; i++) {
+        const item = raw[i] as Record<string, unknown>;
+        if (typeof item !== 'object' || item === null) {
+            throw new Error(`Item [${i + 1}] is not an object`);
+        }
+        const t = item['type'];
+        if (t === 'translation') {
+            if (typeof item['en'] !== 'string') { throw new Error(`Item [${i + 1}] type=translation missing "en"`); }
+            if (typeof item['vi'] !== 'string') { throw new Error(`Item [${i + 1}] type=translation missing "vi"`); }
+        } else if (t === 'pattern') {
+            if (typeof item['regex'] !== 'string')       { throw new Error(`Item [${i + 1}] type=pattern missing "regex"`); }
+            if (typeof item['en_template'] !== 'string') { throw new Error(`Item [${i + 1}] type=pattern missing "en_template"`); }
+            if (typeof item['vi_template'] !== 'string') { throw new Error(`Item [${i + 1}] type=pattern missing "vi_template"`); }
+            if (typeof item['en'] !== 'string') { throw new Error(`Item [${i + 1}] type=pattern missing "en"`); }
+            if (typeof item['vi'] !== 'string') { throw new Error(`Item [${i + 1}] type=pattern missing "vi"`); }
+        } else {
+            throw new Error(`Item [${i + 1}] has unknown type: ${JSON.stringify(t)}`);
+        }
+    }
+}
+
+/**
+ * Substitute {0}, {1}, ... placeholders in a template string.
+ * Each capture group is first looked up in `dict`; if not found the raw group value is used.
+ */
+function applyTemplate(template: string, groups: string[], dict: Dictionary): string {
+    return template.replace(/\{(\d+)\}/g, (_, idx) => {
+        const param = groups[parseInt(idx, 10)] ?? '';
+        return dict.lookup(param) ?? param;
+    });
+}
+
+async function callLLM(
     values: string[],
     model: vscode.LanguageModelChat,
     token: vscode.CancellationToken,
-): Promise<TranslationPair[]> {
+    retryHint?: string,
+): Promise<LLMResult[]> {
     const numbered = values.map((v, i) => `${i + 1}. ${v}`).join('\n');
+    const retryBlock = retryHint
+        ? `\nPREVIOUS ATTEMPT FAILED — fix the issue before answering:\n"${retryHint}"\n`
+        : '';
 
     const messages = [
         vscode.LanguageModelChatMessage.User(
             `You are a translation assistant for a Japanese software/business Excel file.
 Translate each numbered text to English (EN) and Vietnamese (VI).
-Return ONLY a valid JSON array — no markdown fences, no explanation:
-[{"en":"English text","vi":"Tiếng Việt"},...]
+${retryBlock}
+For each item, detect whether it is a TEMPLATE PATTERN — a fixed Japanese phrase containing variable parts (numbers, codes, IDs, dates, names, etc.). If it is a pattern:
+  - output {"type":"pattern","regex":"ECMAScript-regex-with-capture-groups","en_template":"English with {0},{1}...","vi_template":"Việt with {0},{1}...","en":"translation of this exact input","vi":"translation of this exact input"}
+  - regex must match the entire text; use () around each variable part.
+  - Templates use {0},{1},... for capture groups in the same order.
+If it is NOT a pattern (unique phrase), output {"type":"translation","en":"...","vi":"..."}
 
-Input texts:
+RULES:
+1. Return ONLY a valid JSON array — no markdown, no explanation.
+2. Exactly one object per input line, in the same order.
+3. Represent newlines inside values as \\n (two characters). NEVER use actual newlines inside JSON strings.
+
+Example — pattern:
+  Input:  注文番号: 12345
+  Output: {"type":"pattern","regex":"^注文番号: (.+)$","en_template":"Order No.: {0}","vi_template":"Số đơn hàng: {0}","en":"Order No.: 12345","vi":"Số đơn hàng: 12345"}
+
+Example — plain translation:
+  Input:  承認済み
+  Output: {"type":"translation","en":"Approved","vi":"Đã phê duyệt"}
+
+Output format:
+[{...},...]
+
+Input (${values.length} items):
 ${numbered}`,
         ),
     ];
@@ -574,19 +812,51 @@ ${numbered}`,
     const response = await model.sendRequest(messages, {}, token);
     let raw = '';
     for await (const chunk of response.text) { raw += chunk; }
-
-    log.info('Translate', 'LLM response', { chars: raw.length, elapsed: elapsed(t0) });
+    log.info('Translate', 'LLM raw', { chars: raw.length, elapsed: elapsed(t0) });
 
     const jsonMatch = raw.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
-        throw new Error(`LLM không trả về JSON hợp lệ:\n${raw.slice(0, 300)}`);
+        throw new Error(`No JSON array in response — preview: ${raw.slice(0, 200)}`);
     }
-
-    const parsed = JSON.parse(jsonMatch[0]) as TranslationPair[];
-    if (!Array.isArray(parsed) || parsed.length !== values.length) {
-        throw new Error(`Kỳ vọng ${values.length} bản dịch, nhận được ${parsed?.length ?? 0}`);
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+        throw new Error(`JSON.parse failed: ${e} — preview: ${jsonMatch[0].slice(0, 200)}`);
     }
+    validateLLMResults(parsed, values.length);
     return parsed;
+}
+
+// ── Retry wrapper ─────────────────────────────────────────────────────────────
+
+async function translateBatch(
+    values: string[],
+    model: vscode.LanguageModelChat,
+    token: vscode.CancellationToken,
+): Promise<LLMResult[]> {
+    const maxRetries = getMaxRetries();
+    let lastError = '';
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const result = await callLLM(values, model, token, attempt > 1 ? lastError : undefined);
+            if (attempt > 1) {
+                log.info('Translate', 'LLM retry succeeded', { attempt });
+            }
+            return result;
+        } catch (err) {
+            lastError = err instanceof Error ? err.message : String(err);
+            log.warn('Translate', 'LLM attempt failed', {
+                attempt: `${attempt}/${maxRetries}`,
+                reason: lastError.split('\n')[0],
+            });
+            if (attempt === maxRetries) {
+                throw new Error(`LLM failed after ${maxRetries} attempts: ${lastError}`);
+            }
+        }
+    }
+    throw new Error('unreachable');
 }
 
 async function handleTranslate(
@@ -601,7 +871,7 @@ async function handleTranslate(
 
     stream.markdown('### Copatis — Translate\n\n');
 
-    // ── 1. Resolve file ──
+    // ── 1. Resolve file ──────────────────────────────────────────────────────
     let txtPath: string | undefined;
     const specifiedTxt = parseFilenameArg(request.prompt, 'txt');
 
@@ -612,7 +882,7 @@ async function handleTranslate(
             : ws ? path.join(ws, specifiedTxt) : specifiedTxt;
         if (fs.existsSync(resolved)) {
             txtPath = resolved;
-            log.info('Translate', 'Resolved', { from: 'prompt', path: resolved });
+            log.info('Translate', 'File resolved', { from: 'prompt', path: resolved });
         } else {
             log.warn('Translate', 'File not found', { specified: specifiedTxt });
             stream.markdown(`❌ Không tìm thấy file \`${specifiedTxt}\`\n\n`);
@@ -627,133 +897,307 @@ async function handleTranslate(
             title: 'Chọn file TXT cần dịch',
         });
         if (!picked?.length) {
-            log.warn('Translate', 'No file selected by user');
+            log.warn('Translate', 'No file selected');
             stream.markdown('❌ Chưa chọn file. Hãy thử:\n```\n@copatis /translate ten-file.txt\n```');
             return;
         }
         txtPath = picked[0].fsPath;
-        log.info('Translate', 'Resolved', { from: 'picker', path: txtPath });
+        log.info('Translate', 'File resolved', { from: 'picker', path: txtPath });
     }
 
-    // ── 2. Read & parse ──
+    // ── 2. Read & parse ──────────────────────────────────────────────────────
     let content: string;
     try {
         content = fs.readFileSync(txtPath, 'utf-8');
     } catch (err) {
-        log.error('Translate', 'Cannot read file', { path: txtPath, error: String(err) });
+        log.error('Translate', 'Cannot read file', { error: String(err) });
         stream.markdown(`❌ Không đọc được file: ${err}`);
         return;
     }
 
     const lines = content.replace(/\r\n/g, '\n').split('\n');
     const dataLines: Array<{ index: number; prefix: string; value: string }> = [];
-
     lines.forEach((line, i) => {
-        const parsed = parseDataLine(line.trimEnd());
-        if (parsed) dataLines.push({ index: i, ...parsed });
+        const p = parseDataLine(line.trimEnd());
+        if (p) dataLines.push({ index: i, ...p });
     });
 
     if (dataLines.length === 0) {
-        log.warn('Translate', 'No data lines found in file', { path: txtPath });
+        log.warn('Translate', 'No data lines found');
         stream.markdown('⚠️ Không tìm thấy dòng dữ liệu `[Sheet]!Cell|Value` nào trong file.');
         return;
     }
 
-    const totalBatches = Math.ceil(dataLines.length / TRANSLATE_BATCH_SIZE);
-    const relPath = vscode.workspace.asRelativePath(txtPath);
+    const relPath      = vscode.workspace.asRelativePath(txtPath);
+    const batchSize    = getBatchSize();
+    const commentLines = lines.filter(l => l.trimStart().startsWith('#')).length;
+    const blankLines   = lines.filter(l => l.trim() === '').length;
 
-    log.info('Translate', 'Parsed', {
-        file:      relPath,
-        totalLines: lines.length,
-        dataLines:  dataLines.length,
-        batches:    totalBatches,
-        batchSize:  TRANSLATE_BATCH_SIZE,
+    log.info('Translate', 'File parsed', {
+        totalLines:   lines.length,
+        dataLines:    dataLines.length,
+        commentLines,
+        blankLines,
+        batchSize,
+        file:         relPath,
     });
 
-    stream.markdown(`📄 File  : \`${relPath}\`\n`);
-    stream.markdown(`🔢 Dòng  : **${dataLines.length}** dòng cần dịch\n`);
-    stream.markdown(`📦 Batch : ${TRANSLATE_BATCH_SIZE} dòng/lần × ${totalBatches} lần gọi LLM\n\n`);
+    // ── 3. Load dictionaries & pattern library ───────────────────────────────
+    const dictDir    = getDictDir();
+    const dictEN     = new Dictionary(path.join(dictDir, 'dict_ja_en.json'));
+    const dictVI     = new Dictionary(path.join(dictDir, 'dict_ja_vi.json'));
+    const patternLib = new PatternLibrary(path.join(dictDir, 'patterns_ja.json'));
 
-    // ── 3. Pick model ──
+    log.info('Translate', 'Resources loaded', {
+        dir:         vscode.workspace.asRelativePath(dictDir) || dictDir,
+        enSize:      dictEN.size,
+        viSize:      dictVI.size,
+        patterns:    patternLib.size,
+    });
+
+    // ── 4. Pick LLM model ────────────────────────────────────────────────────
     let models = await vscode.lm.selectChatModels({ vendor: 'copilot', family: 'gpt-4o' });
-    if (models.length === 0) {
-        models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-    }
+    if (models.length === 0) { models = await vscode.lm.selectChatModels({ vendor: 'copilot' }); }
     if (models.length === 0) {
         log.error('Translate', 'No LLM model available');
         stream.markdown('❌ Không tìm thấy Copilot LLM model. Hãy đảm bảo GitHub Copilot đang hoạt động.');
         return;
     }
     const model = models[0];
-    log.info('Translate', 'Model selected', { name: model.name, family: model.family ?? 'unknown' });
-    stream.markdown(`🤖 Model : \`${model.name}\`\n\n`);
+    log.info('Translate', 'Model', { name: model.name, family: model.family ?? 'unknown' });
 
-    // ── 4. Batch translate ──
+    // ── 5. Summary header ────────────────────────────────────────────────────
+    stream.markdown(`📄 File      : \`${relPath}\`\n`);
+    stream.markdown(`🔢 Data lines: **${dataLines.length}**\n`);
+    stream.markdown(`📚 Dict EN   : **${dictEN.size}** entries  |  Dict VI: **${dictVI.size}** entries\n`);
+    stream.markdown(`🔖 Patterns  : **${patternLib.size}** templates\n`);
+    stream.markdown(`📦 Batch size: **${batchSize}** (configurable via \`copatis.batchSize\`)\n`);
+    stream.markdown(`🤖 Model     : \`${model.name}\`\n\n`);
+
+    // ── 6. Main loop: passthrough → dict → pattern → LLM ────────────────────
     const outputLines = lines.map(l => l.trimEnd());
-    let processed = 0;
-    let failed = 0;
+    let fromDict        = 0;
+    let fromPassthrough = 0;   // non-Japanese: keep original as EN+VI
+    let fromPattern     = 0;   // matched via PatternLibrary template
+    let fromLLM         = 0;
+    let failed          = 0;
+    let llmBatchNum     = 0;
 
-    for (let i = 0; i < dataLines.length; i += TRANSLATE_BATCH_SIZE) {
+    // Progress tracking
+    let processedCount  = 0;
+    const checkpointEvery = Math.max(50, Math.floor(dataLines.length / 20)); // ~20 checkpoints
+
+    log.info('Translate', 'Loop start', {
+        total:          dataLines.length,
+        batchSize,
+        checkpointEvery,
+        model:          model.name,
+    });
+
+    // value → all output-line positions waiting for this translation (deduplication map)
+    // Each unique value is sent to LLM exactly once; duplicates reuse the same result.
+    const pendingMap = new Map<string, Array<{ index: number; prefix: string }>>();
+
+    /** Flush unique pending values to LLM; apply results to all waiting output lines. */
+    const flushPending = async (): Promise<void> => {
+        if (pendingMap.size === 0) return;
+
+        const batch = [...pendingMap.entries()]; // [[value, [{index,prefix},...]], ...]
+        pendingMap.clear();
+        llmBatchNum++;
+        const batchT0 = Date.now();
+        const totalLines = batch.reduce((s, [, w]) => s + w.length, 0);
+
+        const valPreview = batch.slice(0, 3)
+            .map(([v]) => (v.length > 30 ? v.slice(0, 28) + '…' : v))
+            .join(' │ ');
+        log.info('Translate', 'LLM batch start', {
+            batch:   llmBatchNum,
+            unique:  batch.length,
+            lines:   totalLines,
+            preview: batch.length > 3 ? `${valPreview}  … +${batch.length - 3}` : valPreview,
+        });
+        stream.progress(`LLM batch ${llmBatchNum}: ${batch.length} unique (${totalLines} lines)...`);
+
+        try {
+            const results = await translateBatch(batch.map(([v]) => v), model, token);
+
+            let batchPatterns = 0;
+            batch.forEach(([value, waiters], j) => {
+                const r = results[j];
+                const en = escNl(r.en);
+                const vi = escNl(r.vi);
+
+                // Apply translation to every output line that shares this value
+                for (const w of waiters) {
+                    outputLines[w.index] = `${w.prefix}|${value}|${en}|${vi}`;
+                }
+
+                if (r.type === 'pattern') {
+                    patternLib.add({ regex: r.regex, en_template: r.en_template, vi_template: r.vi_template });
+                    batchPatterns++;
+                }
+                // Cache for future lines (cross-batch dedup via dict, cross-session persistence)
+                dictEN.set(value, en);
+                dictVI.set(value, vi);
+            });
+
+            fromLLM += totalLines;
+            log.info('Translate', 'LLM batch done', {
+                batch:       llmBatchNum,
+                unique:      batch.length,
+                lines:       totalLines,
+                newPatterns: batchPatterns,
+                elapsed:     elapsed(batchT0),
+                dictENnew:   dictEN.newCount,
+                dictVInew:   dictVI.newCount,
+            });
+            const dedup = totalLines - batch.length;
+            stream.markdown(`✔ LLM batch ${llmBatchNum}: ${batch.length} unique`
+                + (dedup > 0 ? ` (+${dedup} dedup)` : '')
+                + (batchPatterns > 0 ? `, ${batchPatterns} patterns learned` : '')
+                + ` — ${elapsed(batchT0)}\n`);
+
+        } catch (err) {
+            const failedLines = batch.reduce((s, [, w]) => s + w.length, 0);
+            failed += failedLines;
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn('Translate', 'LLM batch failed', {
+                batch:   llmBatchNum,
+                failed:  failedLines,
+                elapsed: elapsed(batchT0),
+                reason:  msg.split('\n')[0],
+            });
+            stream.markdown(`⚠️ LLM batch ${llmBatchNum} thất bại (${batch.length} entries): ${msg.split('\n')[0]}\n`);
+        }
+    };
+
+    for (const d of dataLines) {
         if (token.isCancellationRequested) {
-            log.warn('Translate', 'Cancelled by user', { processedSoFar: processed });
+            log.warn('Translate', 'Cancelled by user', {
+                processed: `${processedCount}/${dataLines.length}`,
+                fromDict, fromPattern, fromLLM, failed,
+                elapsed: elapsed(t0),
+            });
+            await flushPending();
             stream.markdown('\n⚠️ Đã hủy bởi người dùng.\n');
             break;
         }
 
-        const batch = dataLines.slice(i, i + TRANSLATE_BATCH_SIZE);
-        const batchNum = Math.floor(i / TRANSLATE_BATCH_SIZE) + 1;
-        const batchT0  = Date.now();
+        if (!needsTranslation(d.value)) {
+            // ① Non-Japanese / symbol-only — passthrough as-is
+            outputLines[d.index] = `${d.prefix}|${d.value}|${d.value}|${d.value}`;
+            fromPassthrough++;
 
-        stream.progress(`Batch ${batchNum}/${totalBatches} — đang dịch ${batch.length} dòng...`);
+        } else {
+            const cachedEN = dictEN.lookup(d.value);
+            const cachedVI = dictVI.lookup(d.value);
 
-        try {
-            const translations = await translateBatch(batch.map(d => d.value), model, token);
+            if (cachedEN !== undefined && cachedVI !== undefined) {
+                // ② Dict cache hit (cross-session or already translated earlier in this run)
+                outputLines[d.index] = `${d.prefix}|${d.value}|${cachedEN}|${cachedVI}`;
+                fromDict++;
 
-            batch.forEach((d, j) => {
-                const t = translations[j];
-                outputLines[d.index] = `${d.prefix}|${d.value}|${t.en}|${t.vi}`;
+            } else {
+                const pm = patternLib.match(d.value);
+
+                if (pm) {
+                    // ③ Pattern library match — substitute template params
+                    const en = escNl(applyTemplate(pm.entry.en_template, pm.groups, dictEN));
+                    const vi = escNl(applyTemplate(pm.entry.vi_template, pm.groups, dictVI));
+                    outputLines[d.index] = `${d.prefix}|${d.value}|${en}|${vi}`;
+                    dictEN.set(d.value, en);
+                    dictVI.set(d.value, vi);
+                    fromPattern++;
+
+                } else {
+                    // ④ Unknown — queue for LLM (deduplicated: same value → shared result)
+                    if (pendingMap.has(d.value)) {
+                        pendingMap.get(d.value)!.push({ index: d.index, prefix: d.prefix });
+                    } else {
+                        pendingMap.set(d.value, [{ index: d.index, prefix: d.prefix }]);
+                    }
+                    if (pendingMap.size >= batchSize) {
+                        await flushPending();
+                    }
+                }
+            }
+        }
+
+        // ── Progress checkpoint ───────────────────────────────────────────────
+        processedCount++;
+        if (processedCount % checkpointEvery === 0 || processedCount === dataLines.length) {
+            const pct = Math.round(processedCount / dataLines.length * 100);
+            const queued = [...pendingMap.values()].reduce((s, w) => s + w.length, 0);
+            log.info('Translate', 'Progress', {
+                processed:   `${processedCount}/${dataLines.length}`,
+                pct:         `${pct}%`,
+                passthrough: fromPassthrough,
+                dict:        fromDict,
+                pattern:     fromPattern,
+                llm:         fromLLM,
+                queued,
+                pending:     pendingMap.size,
+                elapsed:     elapsed(t0),
             });
-
-            processed += batch.length;
-
-            log.info('Translate', 'Batch OK', {
-                batch:    `${batchNum}/${totalBatches}`,
-                sent:     batch.length,
-                ok:       batch.length,
-                elapsed:  elapsed(batchT0),
-                progress: `${processed}/${dataLines.length}`,
-            });
-            stream.markdown(`✔ Batch ${batchNum}/${totalBatches} — ${processed}/${dataLines.length} dòng\n`);
-
-        } catch (err) {
-            failed += batch.length;
-            const msg = err instanceof Error ? err.message : String(err);
-            log.warn('Translate', 'Batch FAILED', {
-                batch:   `${batchNum}/${totalBatches}`,
-                sent:    batch.length,
-                failed:  batch.length,
-                elapsed: elapsed(batchT0),
-                reason:  msg.split('\n')[0],
-            });
-            stream.markdown(`⚠️ Batch ${batchNum} thất bại: ${msg.split('\n')[0]}\n`);
+            stream.progress(
+                `[${pct}%] ${processedCount}/${dataLines.length} dòng`
+                + ` — ⚡${fromPassthrough} giữ nguyên`
+                + ` | 📚${fromDict} từ điển`
+                + (fromPattern > 0 ? ` | 🔖${fromPattern} pattern` : '')
+                + ` | 🤖${fromLLM} LLM`
+                + (queued > 0 ? ` | ⏳${queued} đang chờ` : ''),
+            );
         }
     }
 
-    // ── 5. Write output ──
+    // Flush any remaining entries
+    await flushPending();
+
+    log.info('Translate', 'Loop done', {
+        total:       dataLines.length,
+        passthrough: fromPassthrough,
+        dict:        fromDict,
+        pattern:     fromPattern,
+        llm:         fromLLM,
+        failed,
+        llmBatches:  llmBatchNum,
+        elapsed:     elapsed(t0),
+    });
+
+    // ── 7. Save dictionaries & pattern library ───────────────────────────────
+    dictEN.save();
+    dictVI.save();
+    patternLib.save();
+
+    // ── 8. Write output file ─────────────────────────────────────────────────
     const outputPath = txtPath.replace(/\.txt$/i, '_translated.txt');
     try {
         fs.writeFileSync(outputPath, outputLines.join('\n'), 'utf-8');
 
-        log.info('Translate', 'Written', {
-            path:       vscode.workspace.asRelativePath(outputPath),
-            translated: processed,
-            failed,
-            elapsed:    elapsed(t0),
+        log.info('Translate', 'Done', {
+            fromPassthrough, fromDict, fromPattern, fromLLM, failed,
+            llmBatches:      llmBatchNum,
+            dictENadded:     dictEN.newCount,
+            dictVIadded:     dictVI.newCount,
+            patternsAdded:   patternLib.newCount,
+            patternTotal:    patternLib.size,
+            elapsed:         elapsed(t0),
+            output:          vscode.workspace.asRelativePath(outputPath),
         });
 
-        stream.markdown(`\n---\n✅ **Hoàn thành!**\n\n`);
-        stream.markdown(`- Dịch thành công : **${processed}** dòng\n`);
-        if (failed > 0) stream.markdown(`- Lỗi             : **${failed}** dòng\n`);
+        stream.markdown('\n---\n✅ **Hoàn thành!**\n\n');
+        stream.markdown(`| Nguồn | Số dòng |\n|---|---|\n`);
+        stream.markdown(`| Giữ nguyên (EN/số/ký hiệu) | **${fromPassthrough}** |\n`);
+        stream.markdown(`| Từ điển (cache hit)         | **${fromDict}** |\n`);
+        stream.markdown(`| Patterns (template match)   | **${fromPattern}** |\n`);
+        stream.markdown(`| LLM (${llmBatchNum} batches)              | **${fromLLM}** |\n`);
+        if (failed > 0) {
+            stream.markdown(`| Lỗi                         | **${failed}** |\n`);
+        }
+        stream.markdown(`| Từ điển EN cập nhật         | +**${dictEN.newCount}** entries |\n`);
+        stream.markdown(`| Từ điển VI cập nhật         | +**${dictVI.newCount}** entries |\n`);
+        stream.markdown(`| Patterns mới học được       | +**${patternLib.newCount}** (tổng: ${patternLib.size}) |\n`);
         stream.markdown(`\n📤 Output: \`${vscode.workspace.asRelativePath(outputPath)}\`\n`);
 
         stream.button({
@@ -761,8 +1205,13 @@ async function handleTranslate(
             arguments: [vscode.Uri.file(outputPath)],
             title: '📂 Mở file đã dịch',
         });
+        stream.button({
+            command: 'revealInExplorer',
+            arguments: [vscode.Uri.file(dictDir)],
+            title: '📚 Mở thư mục từ điển',
+        });
     } catch (err) {
-        log.error('Translate', 'Write failed', { path: outputPath, error: String(err) });
+        log.error('Translate', 'Write failed', { error: String(err) });
         stream.markdown(`❌ Không ghi được file output: ${err}`);
     }
 }

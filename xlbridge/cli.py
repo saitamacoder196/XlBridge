@@ -21,6 +21,8 @@ def main(argv: list[str] | None = None) -> None:
     p_extract.add_argument("--input", "-i", required=True, help="Input Excel file")
     p_extract.add_argument("--output", "-o", required=True, help="Output TXT file")
     p_extract.add_argument("--sheet", "-s", action="append", help="Sheet name to extract (repeatable, default: all)")
+    p_extract.add_argument("--no-shapes", action="store_true", default=False, help="Skip shape / text-box text extraction")
+    p_extract.add_argument("--no-notes",  action="store_true", default=False, help="Skip cell comment / note extraction")
 
     # inject
     p_inject = subparsers.add_parser("inject", help="Inject translated TXT back into Excel")
@@ -43,7 +45,13 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if args.command == "extract":
-        extract(args.input, args.output, sheet_names=args.sheet)
+        extract(
+            args.input,
+            args.output,
+            sheet_names=args.sheet,
+            include_shapes=not args.no_shapes,
+            include_notes=not args.no_notes,
+        )
     elif args.command == "inject":
         output = inject(args.input, args.translation, output_path=args.output, lang=args.lang)
         print(f"Output written to: {output}")

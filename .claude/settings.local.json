@@ -8,7 +8,13 @@
       "Bash(python3 -m pytest:*)",
       "Bash(py -m pytest tests/test_parser.py tests/test_injector.py -v)",
       "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -m pytest tests/test_parser.py tests/test_injector.py -v)",
-      "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -m pip install pytest -q)"
+      "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -m pip install pytest -q)",
+      "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -c \"import xlbridge; print\\(''ok''\\)\")",
+      "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -m xlbridge --help)",
+      "Bash(\"D:\\\\XlBridge\\\\venv\\\\Scripts\\\\python.exe\" -m pip install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(echo:*)",
+      "Bash(echo EXIT:$?:*)"
     ]
   }
 }
